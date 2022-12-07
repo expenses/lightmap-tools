@@ -1,0 +1,31 @@
+[package]
+name = "lightmap-tools"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "merge-exrs"
+path = "src/merge-exrs.rs"
+
+[[bin]]
+name = "exr-decompress"
+path = "src/exr-decompress.rs"
+
+[[bin]]
+name = "process-lightvol"
+path = "src/process-lightvol.rs"
+
+[[bin]]
+name = "lightmap-tex-renderer"
+path = "src/lightmap-tex-renderer.rs"
+
+[dependencies]
+anyhow = "1.0.66"
+bytemuck = "1.12.3"
+glam = { version = "0.22.0", features = ["bytemuck"] }
+image = "0.24.5"
+structopt = "0.3.26"
+pollster = "0.2.5"
+wgpu = "0.14.2"
+goth-gltf = { version = "0.1.0", path = "../../goth-gltf" }
+futures-intrusive = "0.5.0"
