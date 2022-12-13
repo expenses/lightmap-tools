@@ -19,6 +19,10 @@ path = "src/process-lightvol.rs"
 name = "lightmap-tex-renderer"
 path = "src/lightmap-tex-renderer.rs"
 
+[[bin]]
+name = "dilate"
+path = "src/dilate.rs"
+
 [dependencies]
 anyhow = "1.0.66"
 bytemuck = "1.12.3"

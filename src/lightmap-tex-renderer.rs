@@ -180,9 +180,8 @@ fn main() -> anyhow::Result<()> {
             entry_point: "vertex",
             buffers: &[],
         },
-        // todo: conversative
         primitive: wgpu::PrimitiveState {
-            conservative: true,
+            conservative: false,
             ..Default::default()
         },
         depth_stencil: None,
@@ -199,26 +198,27 @@ fn main() -> anyhow::Result<()> {
     });
 
     let output_dim = wgpu::Extent3d {
-        width: 512,
-        height: 512,
+        width: 957 * 4,
+        height: 1075 * 4,
         depth_or_array_layers: 1,
     };
 
-    let positions_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        size: (output_dim.width * output_dim.height * 4 * 4) as u64,
+    let pixel_size_in_bytes = 4 * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u32 / pixel_size_in_bytes;
+    let padded_width_padding = (align - output_dim.width % align) % align;
+    let padded_width = output_dim.width + padded_width_padding;
+
+    let buffer_descriptor = wgpu::BufferDescriptor {
+        size: (padded_width * output_dim.height * 4 * 4) as u64,
         label: None,
         mapped_at_creation: false,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-    });
+    };
 
-    let normals_output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        size: (output_dim.width * output_dim.height * 4 * 4) as u64,
-        label: None,
-        mapped_at_creation: false,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-    });
+    let positions_output_buffer = device.create_buffer(&buffer_descriptor);
+    let normals_output_buffer = device.create_buffer(&buffer_descriptor);
 
-    let positions_tex = device.create_texture(&wgpu::TextureDescriptor {
+    let texture_descriptor = wgpu::TextureDescriptor {
         label: None,
         size: output_dim,
         mip_level_count: 1,
@@ -226,16 +226,10 @@ fn main() -> anyhow::Result<()> {
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba32Float,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-    });
-    let normals_tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: None,
-        size: output_dim,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-    });
+    };
+
+    let positions_tex = device.create_texture(&texture_descriptor);
+    let normals_tex = device.create_texture(&texture_descriptor);
 
     let positions_tex_view = positions_tex.create_view(&Default::default());
     let normals_tex_view = normals_tex.create_view(&Default::default());
@@ -272,6 +266,12 @@ fn main() -> anyhow::Result<()> {
 
     drop(render_pass);
 
+    let image_layout = wgpu::ImageDataLayout {
+        offset: 0,
+        bytes_per_row: Some(std::num::NonZeroU32::new(padded_width * 4 * 4).unwrap()),
+        rows_per_image: None,
+    };
+
     command_encoder.copy_texture_to_buffer(
         wgpu::ImageCopyTexture {
             texture: &positions_tex,
@@ -281,11 +281,7 @@ fn main() -> anyhow::Result<()> {
         },
         wgpu::ImageCopyBuffer {
             buffer: &positions_output_buffer,
-            layout: wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(std::num::NonZeroU32::new(output_dim.width * 4 * 4).unwrap()),
-                rows_per_image: None,
-            },
+            layout: image_layout,
         },
         output_dim,
     );
@@ -299,19 +295,25 @@ fn main() -> anyhow::Result<()> {
         },
         wgpu::ImageCopyBuffer {
             buffer: &normals_output_buffer,
-            layout: wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(std::num::NonZeroU32::new(output_dim.width * 4 * 4).unwrap()),
-                rows_per_image: None,
-            },
+            layout: image_layout,
         },
         output_dim,
     );
 
     queue.submit(Some(command_encoder.finish()));
 
-    let positions_floats = slice_to_bytes(&positions_output_buffer.slice(..), &device);
-    let normals_floats = slice_to_bytes(&normals_output_buffer.slice(..), &device);
+    let positions_floats = slice_to_bytes(
+        &positions_output_buffer.slice(..),
+        &device,
+        output_dim,
+        padded_width,
+    );
+    let normals_floats = slice_to_bytes(
+        &normals_output_buffer.slice(..),
+        &device,
+        output_dim,
+        padded_width,
+    );
 
     /*let positions_output_buffer_slice = positions_output_buffer.slice(..);
     // Sets the buffer up for mapping, sending over the result of the mapping back to us when it is finished.
@@ -330,7 +332,12 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn slice_to_bytes(buffer_slice: &wgpu::BufferSlice, device: &wgpu::Device) -> Vec<f32> {
+fn slice_to_bytes(
+    buffer_slice: &wgpu::BufferSlice,
+    device: &wgpu::Device,
+    extent: wgpu::Extent3d,
+    padded_width: u32,
+) -> Vec<f32> {
     let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
     buffer_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
 
@@ -338,8 +345,19 @@ fn slice_to_bytes(buffer_slice: &wgpu::BufferSlice, device: &wgpu::Device) -> Ve
 
     if let Some(Ok(())) = pollster::block_on(receiver.receive()) {
         let data = buffer_slice.get_mapped_range();
-        let floats: &[f32] = bytemuck::cast_slice(&data);
-        floats.to_vec()
+        let pixels: &[glam::Vec4] = bytemuck::cast_slice(&data);
+
+        let mut output = Vec::new();
+
+        for row in 0..extent.height {
+            let offset = (row * padded_width) as usize;
+
+            output.extend_from_slice(bytemuck::cast_slice(
+                &pixels[offset..offset + extent.width as usize],
+            ));
+        }
+
+        output
     } else {
         panic!()
     }
