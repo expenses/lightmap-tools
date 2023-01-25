@@ -1,23 +1,25 @@
-fn main() {
-    let (mut base, mut total_samples) = load_image(&std::env::args().nth(1).unwrap());
+use rayon::iter::{IntoParallelRefIterator, ParallelBridge, ParallelIterator};
 
-    for path in std::env::args().skip(2) {
+fn main() {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+
+    let base = parking_lot::Mutex::new(load_image(&args[0]));
+
+    // Note: exr decompression is already parallelised and this only slightly improves
+    // performance.
+    args[1..].par_iter().for_each(|path| {
         let (new_image, new_samples) = load_image(&path);
 
-        total_samples += new_samples;
+        let mut base = base.lock();
 
-        for x in 0..base.width() {
-            for y in 0..base.height() {
-                let pixel = new_image.get_pixel(x, y);
+        base.1 += new_samples;
 
-                let mut dest_pixel = base.get_pixel_mut(x, y);
-
-                dest_pixel.0[0] += pixel.0[0];
-                dest_pixel.0[1] += pixel.0[1];
-                dest_pixel.0[2] += pixel.0[2];
-            }
+        for (base, new) in (&mut *base.0).iter_mut().zip(&*new_image) {
+            *base += *new;
         }
-    }
+    });
+
+    let (mut base, total_samples) = base.into_inner();
 
     for pixel in base.pixels_mut() {
         for subpixel in &mut pixel.0 {
@@ -31,15 +33,17 @@ fn main() {
 }
 
 fn load_image(path: &str) -> (image::ImageBuffer<image::Rgb<f32>, Vec<f32>>, u32) {
-    let (_, second_chunk) = path.split_once("_").unwrap();
+    let (_, second_chunk) = path.rsplit_once("_").unwrap();
     let (num_samples, _) = second_chunk.split_once(".").unwrap();
     let num_samples: u32 = num_samples.parse().unwrap();
 
     let mut image = image::open(path).unwrap().to_rgb32f();
 
-    for pixel in image.pixels_mut() {
-        for subpixel in &mut pixel.0 {
-            *subpixel *= num_samples as f32;
+    for subpixel in &mut *image {
+        *subpixel *= num_samples as f32;
+
+        if subpixel.is_nan() {
+            *subpixel = 0.0;
         }
     }
 

@@ -8,8 +8,8 @@ name = "merge-exrs"
 path = "src/merge-exrs.rs"
 
 [[bin]]
-name = "exr-decompress"
-path = "src/exr-decompress.rs"
+name = "lightmap-to-ktx2"
+path = "src/lightmap-to-ktx2.rs"
 
 [[bin]]
 name = "process-lightvol"
@@ -23,6 +23,14 @@ path = "src/lightmap-tex-renderer.rs"
 name = "dilate"
 path = "src/dilate.rs"
 
+[[bin]]
+name = "lightvol-to-ktx2"
+path = "src/lightvol-to-ktx2.rs"
+
+[[bin]]
+name = "add-exrs"
+path = "src/add-exrs.rs"
+
 [dependencies]
 anyhow = "1.0.66"
 bytemuck = "1.12.3"
@@ -33,3 +41,8 @@ pollster = "0.2.5"
 wgpu = "0.14.2"
 goth-gltf = { version = "0.1.0", path = "../../goth-gltf" }
 futures-intrusive = "0.5.0"
+ktx2-tools = { path = "../../ktx2-tools" }
+half = { version = "2.2.0", features = ["bytemuck"] }
+rayon = "1.6.1"
+parking_lot = "0.12.1"
+futures = "0.3.25"

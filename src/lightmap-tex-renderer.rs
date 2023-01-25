@@ -6,10 +6,19 @@ use std::collections::HashMap;
 use std::path::Path;
 use wgpu::util::DeviceExt;
 
+use structopt::StructOpt;
+
+#[derive(StructOpt)]
+pub struct Opts {
+    filepath: std::path::PathBuf,
+    width: u32,
+    height: u32,
+}
+
 fn main() -> anyhow::Result<()> {
-    let filepath = std::env::args().nth(1).unwrap();
-    let bytes = std::fs::read(&filepath).unwrap();
-    let path = Path::new(&filepath);
+    let opts = Opts::from_args();
+
+    let bytes = std::fs::read(&opts.filepath).unwrap();
 
     let (gltf, buffer): (
         goth_gltf::Gltf<goth_gltf::default_extensions::Extensions>,
@@ -17,7 +26,7 @@ fn main() -> anyhow::Result<()> {
     ) = goth_gltf::Gltf::from_bytes(&bytes).unwrap();
 
     let node_tree = NodeTree::new(&gltf);
-    let buffer_view_map = collect_buffer_view_map(&gltf, buffer, &path)?;
+    let buffer_view_map = collect_buffer_view_map(&gltf, buffer, &opts.filepath)?;
 
     let mut combined_positions = Vec::new();
     let mut combined_normals = Vec::new();
@@ -198,8 +207,8 @@ fn main() -> anyhow::Result<()> {
     });
 
     let output_dim = wgpu::Extent3d {
-        width: 957 * 4,
-        height: 1075 * 4,
+        width: opts.width * 4,
+        height: opts.height * 4,
         depth_or_array_layers: 1,
     };
 
@@ -302,23 +311,20 @@ fn main() -> anyhow::Result<()> {
 
     queue.submit(Some(command_encoder.finish()));
 
-    let positions_floats = slice_to_bytes(
-        &positions_output_buffer.slice(..),
-        &device,
-        output_dim,
-        padded_width,
-    );
-    let normals_floats = slice_to_bytes(
-        &normals_output_buffer.slice(..),
-        &device,
-        output_dim,
-        padded_width,
-    );
-
-    /*let positions_output_buffer_slice = positions_output_buffer.slice(..);
-    // Sets the buffer up for mapping, sending over the result of the mapping back to us when it is finished.
-    let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
-    positions_output_buffer_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());*/
+    let (positions_floats, normals_floats) = pollster::block_on(futures::future::join(
+        slice_to_bytes(
+            &positions_output_buffer.slice(..),
+            &device,
+            output_dim,
+            padded_width,
+        ),
+        slice_to_bytes(
+            &normals_output_buffer.slice(..),
+            &device,
+            output_dim,
+            padded_width,
+        ),
+    ));
 
     image::Rgba32FImage::from_raw(output_dim.width, output_dim.height, positions_floats)
         .unwrap()
@@ -332,8 +338,8 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn slice_to_bytes(
-    buffer_slice: &wgpu::BufferSlice,
+async fn slice_to_bytes(
+    buffer_slice: &wgpu::BufferSlice<'_>,
     device: &wgpu::Device,
     extent: wgpu::Extent3d,
     padded_width: u32,
@@ -343,7 +349,7 @@ fn slice_to_bytes(
 
     device.poll(wgpu::Maintain::Wait);
 
-    if let Some(Ok(())) = pollster::block_on(receiver.receive()) {
+    if let Some(Ok(())) = receiver.receive().await {
         let data = buffer_slice.get_mapped_range();
         let pixels: &[glam::Vec4] = bytemuck::cast_slice(&data);
 
