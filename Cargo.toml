@@ -31,6 +31,10 @@ path = "src/lightvol-to-ktx2.rs"
 name = "add-exrs"
 path = "src/add-exrs.rs"
 
+[[bin]]
+name = "fix-seams"
+path = "src/fix-seams.rs"
+
 [dependencies]
 anyhow = "1.0.66"
 bytemuck = "1.12.3"
@@ -46,3 +50,6 @@ half = { version = "2.2.0", features = ["bytemuck"] }
 rayon = "1.6.1"
 parking_lot = "0.12.1"
 futures = "0.3.25"
+svg = "0.13.0"
+ordered-float = "3.4.0"
+rstar = "0.9.3"
