@@ -213,33 +213,34 @@ fn main() -> anyhow::Result<()> {
         depth_or_array_layers: 1,
     };
 
-    let pixel_size_in_bytes = 4 * 4;
-    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u32 / pixel_size_in_bytes;
-    let padded_width_padding = (align - output_dim.width % align) % align;
-    let padded_width = output_dim.width + padded_width_padding;
+    let calculate_padding_for_pixel_size = |pixel_size_in_bytes| {
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u32 / pixel_size_in_bytes;
+        let padded_width_padding = (align - output_dim.width % align) % align;
+        output_dim.width + padded_width_padding
+    };
 
-    let buffer_descriptor = wgpu::BufferDescriptor {
-        size: (padded_width * output_dim.height * 4 * 4) as u64,
+    let buffer_descriptor_for_pixel_size = |pixel_size_in_bytes| wgpu::BufferDescriptor {
+        size: (calculate_padding_for_pixel_size(pixel_size_in_bytes) * output_dim.height * pixel_size_in_bytes) as u64,
         label: None,
         mapped_at_creation: false,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
     };
 
-    let positions_output_buffer = device.create_buffer(&buffer_descriptor);
-    let normals_output_buffer = device.create_buffer(&buffer_descriptor);
+    let positions_output_buffer = device.create_buffer(&buffer_descriptor_for_pixel_size(4 * 4));
+    let normals_output_buffer = device.create_buffer(&buffer_descriptor_for_pixel_size(4 * 4));
 
-    let texture_descriptor = wgpu::TextureDescriptor {
+    let texture_descriptor_for_format = |format| wgpu::TextureDescriptor {
         label: None,
         size: output_dim,
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba32Float,
+        format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
     };
 
-    let positions_tex = device.create_texture(&texture_descriptor);
-    let normals_tex = device.create_texture(&texture_descriptor);
+    let positions_tex = device.create_texture(&texture_descriptor_for_format(wgpu::TextureFormat::Rgba32Float));
+    let normals_tex = device.create_texture(&texture_descriptor_for_format(wgpu::TextureFormat::Rgba32Float));
 
     let positions_tex_view = positions_tex.create_view(&Default::default());
     let normals_tex_view = normals_tex.create_view(&Default::default());
@@ -276,9 +277,9 @@ fn main() -> anyhow::Result<()> {
 
     drop(render_pass);
 
-    let image_layout = wgpu::ImageDataLayout {
+    let image_layout_for_pixel_size = |pixel_size_in_bytes| wgpu::ImageDataLayout {
         offset: 0,
-        bytes_per_row: Some(std::num::NonZeroU32::new(padded_width * 4 * 4).unwrap()),
+        bytes_per_row: Some(std::num::NonZeroU32::new(calculate_padding_for_pixel_size(pixel_size_in_bytes) * pixel_size_in_bytes).unwrap()),
         rows_per_image: None,
     };
 
@@ -291,7 +292,7 @@ fn main() -> anyhow::Result<()> {
         },
         wgpu::ImageCopyBuffer {
             buffer: &positions_output_buffer,
-            layout: image_layout,
+            layout: image_layout_for_pixel_size(4 * 4),
         },
         output_dim,
     );
@@ -305,7 +306,7 @@ fn main() -> anyhow::Result<()> {
         },
         wgpu::ImageCopyBuffer {
             buffer: &normals_output_buffer,
-            layout: image_layout,
+            layout: image_layout_for_pixel_size(4 * 4),
         },
         output_dim,
     );
@@ -317,13 +318,13 @@ fn main() -> anyhow::Result<()> {
             &positions_output_buffer.slice(..),
             &device,
             output_dim,
-            padded_width,
+            calculate_padding_for_pixel_size(4 * 4),
         ),
         slice_to_bytes(
             &normals_output_buffer.slice(..),
             &device,
             output_dim,
-            padded_width,
+            calculate_padding_for_pixel_size(4 * 4),
         ),
     ));
 

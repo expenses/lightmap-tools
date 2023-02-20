@@ -1,2 +1,4 @@
 /target
 *.exr
+*.png
+*.cpp

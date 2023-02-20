@@ -1,6 +1,5 @@
 #[path = "lightmap-tex-renderer/accessors.rs"]
 mod accessors;
-//mod bindings;
 use glam::{UVec2, Vec2, Vec3};
 use goth_gltf::default_extensions::Extensions;
 use goth_gltf::extensions::CompressionMode;
