@@ -1,446 +1,643 @@
+use glam::{Vec2, Vec3};
+use nalgebra::DVector;
+use nalgebra_sparse::{coo::CooMatrix, csr::CsrMatrix};
+use std::collections::HashMap;
+use std::path::Path;
+use std::hash::{Hash, Hasher};
+use std::ops::{Index, IndexMut};
 #[path = "lightmap-tex-renderer/accessors.rs"]
 mod accessors;
-use glam::{UVec2, Vec2, Vec3};
-use goth_gltf::default_extensions::Extensions;
-use goth_gltf::extensions::CompressionMode;
 use lightmap_tools::{collect_buffer_view_map, NodeTree};
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use wgpu::util::DeviceExt;
 
-use structopt::StructOpt;
 
-#[derive(StructOpt)]
-pub struct Opts {
-    filepath: std::path::PathBuf,
-    image: std::path::PathBuf,
+const EDGE_CONSTRAINTS_WEIGHT: f32 = 5.0;
+const COVERED_PIXELS_WEIGHT: f32 = 1.0;
+const NONCOVERED_PIXELS_WEIGHT: f32 = 0.1;
+const TOLERANCE: f32 = 0.01 / 255.0;
+
+struct Array2d<T> {
+    data: Vec<T>,
     width: u32,
     height: u32,
 }
 
-fn main() -> anyhow::Result<()> {
-    let opts = Opts::from_args();
-
-    let mut img = image::open(&opts.image).unwrap();
-
-    let mut img = img
-        //.crop_imm(0, 0, img.width() / 4, img.height())
-        .to_rgb32f();
-
-    let bytes = std::fs::read(&opts.filepath).unwrap();
-
-    let (gltf, buffer): (
-        goth_gltf::Gltf<goth_gltf::default_extensions::Extensions>,
-        _,
-    ) = goth_gltf::Gltf::from_bytes(&bytes).unwrap();
-
-    let node_tree = NodeTree::new(&gltf);
-    let buffer_view_map = collect_buffer_view_map(&gltf, buffer, &opts.filepath)?;
-
-    let mut combined_positions = Vec::new();
-    let mut combined_normals = Vec::new();
-    let mut combined_second_uvs = Vec::new();
-    let mut combined_indices = Vec::new();
-
-    for (node_id, node) in gltf.nodes.iter().enumerate() {
-        let transform = node_tree.transform_of(node_id);
-        let normal_matrix = glam::Mat3::from_mat4(transform.inverse().transpose());
-
-        let mesh_id = match node.mesh {
-            Some(mesh_id) => mesh_id,
-            None => continue,
-        };
-
-        let mesh = &gltf.meshes[mesh_id];
-
-        for (primitive_id, primitive) in mesh.primitives.iter().enumerate() {
-            let reader = accessors::PrimitiveReader::new(&gltf, &primitive, &buffer_view_map);
-
-            let positions = match reader.read_positions()? {
-                None => {
-                    println!(
-                        "Positions missing for mesh {}, primitive {}. Skipping",
-                        mesh_id, primitive_id
-                    );
-                    continue;
-                }
-                Some(positions) => positions,
-            };
-
-            let indices = match reader.read_indices()? {
-                None => {
-                    println!(
-                        "Indices missing for mesh {}, primitive {}. Skipping",
-                        mesh_id, primitive_id
-                    );
-                    continue;
-                }
-                Some(indices) => indices,
-            };
-
-            let second_uvs = match reader.read_second_uvs()? {
-                None => {
-                    println!(
-                        "Second UVs missing for mesh {}, primitive {}. Skipping",
-                        mesh_id, primitive_id
-                    );
-                    continue;
-                }
-                Some(second_uvs) => second_uvs,
-            };
-
-            let normals = reader.read_normals()?.unwrap();
-
-            let indices_offset = combined_positions.len() as u32;
-
-            let index_offset = combined_positions.len() as u32;
-
-            combined_indices.extend(indices.iter().map(|&index| index + index_offset));
-            combined_positions.extend(
-                positions
-                    .iter()
-                    .map(|&position| (transform * position.extend(1.0)).truncate()),
-            );
-            combined_normals.extend(normals.iter().map(|&normal| normal_matrix * normal));
-            combined_second_uvs.extend_from_slice(&second_uvs);
+impl<T: Clone> Array2d<T> {
+    fn new(width: u32, height: u32, default_t: T) -> Self {
+        Self {
+            data: vec![default_t; width as usize * height as usize],
+            width,
+            height,
         }
     }
-
-    let mut edge_indices: Vec<(u32, u32)> = Vec::new();
-
-    let mut tree: rstar::RTree<Edge> = Default::default();
-
-    let mut contained: HashSet<(u32, u32)> = HashSet::default();
-
-    let edge_iterator = combined_indices
-        .chunks(3)
-        .flat_map(|tri| [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])]);
-
-    for (a, b) in edge_iterator.clone() {
-        let edge = Edge::new(
-            Vertex {
-                pos: combined_positions[a as usize],
-                normal: combined_normals[a as usize],
-                uv: combined_second_uvs[a as usize],
-                index: a,
-            },
-            Vertex {
-                pos: combined_positions[b as usize],
-                normal: combined_normals[b as usize],
-                uv: combined_second_uvs[b as usize],
-                index: b,
-            },
-        );
-        if !contained.contains(&(edge.a.index, edge.b.index)) {
-            tree.insert(edge);
-        }
-        contained.insert((edge.a.index, edge.b.index));
-    }
-
-    let lookup_distance = 0.001;
-    let lookup_distance_sq = lookup_distance * lookup_distance;
-
-    let uv_lookup_distance = 0.0001;
-    let uv_lookup_distance_sq = lookup_distance * lookup_distance;
-
-    let mut matches = 0;
-
-    use svg::node::element::path::Data;
-    use svg::node::element::*;
-    use svg::Document;
-
-    let mut doc = svg::Document::new();
-
-    let mut data = Data::new();
-    let mut circles = Vec::new();
-
-    let scale = glam::Vec2::new(opts.width as f32, opts.height as f32);
-
-    let mut stitching_points_to_match = Vec::new();
-
-    let mut total_stitching_points = 0;
-
-    for (a, b) in edge_iterator {
-        let compare_edge = Edge::new(
-            Vertex {
-                pos: combined_positions[a as usize],
-                normal: combined_normals[a as usize],
-                uv: combined_second_uvs[a as usize],
-                index: a,
-            },
-            Vertex {
-                pos: combined_positions[b as usize],
-                normal: combined_normals[b as usize],
-                uv: combined_second_uvs[b as usize],
-                index: b,
-            },
-        );
-
-        data = data
-            .move_to(<(f32, f32)>::from(compare_edge.a.uv * scale))
-            .line_to(<(f32, f32)>::from(compare_edge.b.uv * scale));
-
-        for x in tree.locate_within_distance(compare_edge.a.pos.into(), lookup_distance_sq) {
-            if x.a.index == compare_edge.a.index && x.b.index == compare_edge.b.index {
-                continue;
-            }
-
-            if x.b.pos.distance_squared(compare_edge.b.pos) > lookup_distance_sq {
-                continue;
-            }
-
-            if x.a.uv.distance_squared(compare_edge.a.uv) < uv_lookup_distance_sq {
-                continue;
-            }
-
-            if x.b.uv.distance_squared(compare_edge.b.uv) < uv_lookup_distance_sq {
-                continue;
-            }
-
-            let x_normal = (x.a.normal + x.b.normal).normalize();
-
-            let edge_normal = (compare_edge.a.normal + compare_edge.b.normal).normalize();
-
-            if x_normal.dot(edge_normal) < 0.9 {
-                continue;
-            }
-
-            let x_center = (x.a.uv + x.b.uv) / 2.0;
-            let comp_center = (compare_edge.a.uv + compare_edge.b.uv) / 2.0;
-
-            circles.push(
-                Circle::new()
-                    .set("fill", "none")
-                    .set("stroke", "blue")
-                    .set("stroke-width", 0.2)
-                    .set("cx", comp_center.x * scale.x)
-                    .set("cy", comp_center.y * scale.y)
-                    .set("r", 0.5),
-            );
-
-            circles.push(
-                Circle::new()
-                    .set("fill", "none")
-                    .set("stroke", "red")
-                    .set("stroke-width", 0.2)
-                    .set("cx", x_center.x * scale.x)
-                    .set("cy", x_center.y * scale.y)
-                    .set("r", 0.5),
-            );
-
-            let edge_uv_length = (compare_edge.a.uv * scale).distance(compare_edge.b.uv * scale);
-            let x_uv_length = (x.a.uv * scale).distance(x.b.uv * scale);
-
-            let max_edge_length = edge_uv_length.max(x_uv_length);
-
-            // the paper uses 3 per texel but that might be too many for testing.
-            let num_sample_points_per_pixel_length = 0.5; //1.0;//0.005;//3.;
-
-            let num_sample_points =
-                (max_edge_length * num_sample_points_per_pixel_length).ceil() as usize;
-
-            let mut compare_sample_points: Vec<Vec2> = Vec::with_capacity(num_sample_points);
-            let mut x_sample_points: Vec<Vec2> = Vec::with_capacity(num_sample_points);
-
-            let step = 1.0 / (num_sample_points as f32 + 1.0);
-
-            let compare_diff = (compare_edge.b.uv - compare_edge.a.uv) * scale;
-            let x_diff = (x.b.uv - x.a.uv) * scale;
-
-            for i in 1..1 + num_sample_points {
-                compare_sample_points
-                    .push(compare_edge.a.uv * scale + compare_diff * step * i as f32);
-                x_sample_points.push(x.a.uv * scale + x_diff * step * i as f32);
-
-                let wwww = compare_edge.a.uv * scale + compare_diff * step * i as f32; //x.a.uv * scale + x_diff * step * i as f32;
-
-                let zzzz = x.a.uv * scale + x_diff * step * i as f32;
-
-                circles.push(
-                    Circle::new()
-                        .set("fill", "none")
-                        .set("stroke", "green")
-                        .set("stroke-width", 0.2)
-                        .set("cx", zzzz.x)
-                        .set("cy", zzzz.y)
-                        .set("r", 0.25),
-                );
-
-                circles.push(
-                    Circle::new()
-                        .set("fill", "none")
-                        .set("stroke", "green")
-                        .set("stroke-width", 0.2)
-                        .set("cx", wwww.x)
-                        .set("cy", wwww.y)
-                        .set("r", 0.25),
-                );
-            }
-
-            total_stitching_points += num_sample_points;
-
-            stitching_points_to_match.push((compare_sample_points, x_sample_points));;
-        }
-
-        tree.remove(&compare_edge);
-    }
-
-    let mut img2 = img.clone();
-
-    for (edge_a_points, edge_b_points) in &stitching_points_to_match {
-        for (&a, &b) in edge_a_points.iter().zip(edge_b_points) {
-            let (a_coords, a_weights) =
-                get_coords_and_weights(a, UVec2::new(opts.width, opts.height));
-            let (b_coords, b_weights) =
-                get_coords_and_weights(b, UVec2::new(opts.width, opts.height));
-
-            let mut a_value = Vec3::ZERO;
-            for (&coord, weight) in a_coords.iter().zip(a_weights) {
-                a_value += Vec3::from(img[coord].0) * weight;
-            }
-
-            let mut b_value = Vec3::ZERO;
-            for (&coord, weight) in b_coords.iter().zip(b_weights) {
-                b_value += Vec3::from(img[coord].0) * weight;
-            }
-
-            let avg = (a_value + b_value) / 2.0;
-
-            //dbg!(a_weights, b_weights);
-
-            for coord in a_coords.into_iter().chain(b_coords) {
-                //img2[coord] = image::Rgb(avg.into());
-            }
-        }
-    }
-
-    doc = doc.add(Image::new().set("href", "img3.png"));
-
-    let path = Path::new()
-        .set("fill", "none")
-        .set("stroke", "blue")
-        .set("stroke-width", 0.1)
-        .set("d", data);
-
-    doc = doc.add(path);
-
-    image::DynamicImage::from(img2)
-        .to_rgb8()
-        .save("img3.png")
-        .unwrap();
-
-    for circle in circles {
-        doc = doc.add(circle);
-    }
-
-    doc = doc.set("viewBox", (0, 0, opts.width, opts.height));
-
-    svg::save("image.svg", &doc).unwrap();
-
-    dbg!(
-        &stitching_points_to_match.len(),
-        total_stitching_points,
-        total_stitching_points as f32 / stitching_points_to_match.len() as f32
-    );
-
-    Ok(())
 }
 
-fn get_coords_and_weights(p: Vec2, dimensions: UVec2) -> ([(u32, u32); 4], [f32; 4]) {
-    let p = p - 0.5;
+impl<T> Index<(u32, u32)> for Array2d<T> {
+    type Output = T;
 
-    let p_fract = p.fract();
-    let p_u = p.as_uvec2();
-    let p_u_1 = (p_u + 1).min(dimensions - 1);
+    fn index(&self, (column, row): (u32, u32)) -> &Self::Output {
+        &self.data[row as usize * self.width as usize + column as usize]
+    }
+}
 
-    (
-        [
-            (p_u.x, p_u.y),
-            (p_u_1.x, p_u.y),
-            (p_u.x, p_u_1.y),
-            (p_u_1.x, p_u_1.y),
-        ],
-        [
-            (1.0 - p_fract.x) * (1.0 - p_fract.y),
-            p_fract.x * (1.0 - p_fract.y),
-            (1.0 - p_fract.x) * p_fract.y,
-            p_fract.x * p_fract.y,
-        ],
-    )
+impl<T> IndexMut<(u32, u32)> for Array2d<T> {
+    fn index_mut(&mut self, (column, row): (u32, u32)) -> &mut Self::Output {
+        &mut self.data[row as usize * self.width as usize + column as usize]
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HalfEdge {
+    a: Vec2,
+    b: Vec2,
+}
+
+fn uv_to_screen(mut in_vec2: Vec2, w: u32, h: u32) -> Vec2 {
+    //in_vec2.y = 1.0 - in_vec2.y;
+    in_vec2.x *= w as f32;
+    in_vec2.y *= h as f32;
+    in_vec2 - Vec2::splat(0.5)
+}
+
+fn wrap_coordinate(mut x: i32, size: u32) -> u32 {
+    while x < 0 {
+        x += size as i32;
+    }
+    while x >= size as i32 {
+        x -= size as i32;
+    }
+    x as u32
 }
 
 struct SeamEdge {
-    a: Vec2,
-    b: Vec2,
-    stitching_points: Vec<Vec2>,
+    edges: [HalfEdge; 2],
 }
 
-fn compare_vecs(a: Vec3, b: Vec3) -> std::cmp::Ordering {
-    match a.x.partial_cmp(&b.x) {
-        Some(ordering @ (std::cmp::Ordering::Less | std::cmp::Ordering::Greater)) => {
-            return ordering
+impl SeamEdge {
+    fn num_samples(&self, w: u32, h: u32) -> u32 {
+        let e0 = uv_to_screen(self.edges[0].b, w, h) - uv_to_screen(self.edges[0].a, w, h);
+        let e1 = uv_to_screen(self.edges[1].b, w, h) - uv_to_screen(self.edges[1].a, w, h);
+        let len = e0.length().max(e1.length()).max(2.0);
+        (len * 3.0) as u32
+    }
+}
+
+#[derive(Debug, Default)]
+struct Mesh {
+    indices: Vec<u32>,
+    positions: Vec<Vec3>,
+    uvs: Vec<Vec2>,
+}
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+struct HashWrapper<T>(T);
+
+impl<T: PartialEq> Eq for HashWrapper<T> {}
+
+impl Hash for HashWrapper<Vec2> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u32(self.0.x.to_bits());
+        state.write_u32(self.0.y.to_bits());
+    }
+}
+
+impl Hash for HashWrapper<Vec3> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u32(self.0.x.to_bits());
+        state.write_u32(self.0.y.to_bits());
+        state.write_u32(self.0.z.to_bits());
+    }
+}
+
+fn find_seam_edges(mesh: &Mesh) -> Vec<SeamEdge> {
+    let mut edge_map: HashMap<
+        (HashWrapper<Vec3>, HashWrapper<Vec3>),
+        (HashWrapper<Vec2>, HashWrapper<Vec2>),
+        _,
+    > = HashMap::new();
+
+    let mut seam_edges = Vec::new();
+
+    for tri in mesh.indices.chunks(3) {
+        let edges = [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])];
+
+        for (index_0, index_1) in edges {
+            let v0 = HashWrapper(mesh.positions[index_0 as usize]);
+            let v1 = HashWrapper(mesh.positions[index_1 as usize]);
+            let uv0 = HashWrapper(mesh.uvs[index_0 as usize]);
+            let uv1 = HashWrapper(mesh.uvs[index_1 as usize]);
+            //let edge = (v0, v1);
+            //let other_edge = (v1, v0);
+
+            let other_edge_key = (v1, v0);
+
+            if !edge_map.contains_key(&other_edge_key) {
+                edge_map.insert((v0, v1), (uv0, uv1));
+            } else {
+                // This edge has already been added once, so we have enough information to see if it's a normal edge, or a "seam edge".
+                let (other_uv0, other_uv1) = *edge_map.get(&other_edge_key).unwrap();
+                if other_uv0 != uv1 || other_uv1 != uv0 {
+                    // UV don't match, so we have a seam
+                    let s = SeamEdge {
+                        edges: [
+                            HalfEdge { a: uv0.0, b: uv1.0 },
+                            HalfEdge {
+                                a: other_uv1.0,
+                                b: other_uv0.0,
+                            },
+                        ],
+                    };
+                    seam_edges.push(s);
+                }
+                edge_map.remove(&other_edge_key); // No longer need this edge, remove it to keep storage low
+            }
         }
-        _ => {}
     }
 
-    match a.y.partial_cmp(&b.y) {
-        Some(ordering @ (std::cmp::Ordering::Less | std::cmp::Ordering::Greater)) => {
-            return ordering
+    seam_edges
+}
+
+fn is_inside(x: i32, y: i32, ea: Vec2, eb: Vec2) -> bool {
+    x as f32 * (eb.y - ea.y) - y as f32 * (eb.x - ea.x) - ea.x * eb.y + ea.y * eb.x >= 0.0
+}
+
+fn rasterize_face(uv0: Vec2, uv1: Vec2, uv2: Vec2, coverage_buf: &mut Array2d<bool>) {
+    let uv0 = uv_to_screen(uv0, coverage_buf.width, coverage_buf.height);
+    let uv1 = uv_to_screen(uv1, coverage_buf.width, coverage_buf.height);
+    let uv2 = uv_to_screen(uv2, coverage_buf.width, coverage_buf.height);
+
+    // Axis aligned bounds of the triangle
+    let minx = (uv0.x).min(uv1.x).min(uv2.x) as i32;
+    let maxx = (uv0.x).max(uv1.x).max(uv2.x) as i32 + 1;
+    let miny = (uv0.y).min(uv1.y).min(uv2.y) as i32;
+    let maxy = (uv0.y).max(uv1.y).max(uv2.y) as i32 + 1;
+
+    // The three edges we will test
+    let e0a = uv0;
+    let e0b = uv1;
+    let e1a = uv1;
+    let e1b = uv2;
+    let e2a = uv2;
+    let e2b = uv0;
+
+    // Now just loop over a screen aligned bounding box around the triangle, and test each pixel against all three edges
+    for y in miny..maxy {
+        for x in minx..maxx {
+            if (is_inside(x, y, e0a, e0b) && is_inside(x, y, e1a, e1b) && is_inside(x, y, e2a, e2b)) || (is_inside(x, y, e0b, e0a) && is_inside(x, y, e1b, e1a) && is_inside(x, y, e2b, e2a)) {
+                let index = (
+                    wrap_coordinate(x, coverage_buf.width),
+                    wrap_coordinate(y, coverage_buf.height),
+                );
+                coverage_buf[index] = true;
+            }
         }
-        _ => {}
     }
-
-    a.z.partial_cmp(&b.z).unwrap()
 }
 
-#[derive(Clone, Copy, PartialEq, Debug, Default)]
-struct Vertex {
-    pos: Vec3,
-    uv: Vec2,
-    normal: Vec3,
-    index: u32,
-}
-
-#[derive(Clone, Copy, PartialEq, Debug, Default)]
-struct Edge {
-    a: Vertex,
-    b: Vertex,
-}
-
-impl From<Vec3> for Edge {
-    fn from(vec: Vec3) -> Self {
-        Self {
-            a: Vertex {
-                pos: vec,
-                ..Default::default()
-            },
-            ..Default::default()
+fn dilate_pixel(
+    centerx: u32,
+    centery: u32,
+    image: &image::Rgb32FImage,
+    coverage_buf: &Array2d<bool>,
+) -> Vec3 {
+    let mut num_pixels = 0;
+    let mut sum = Vec3::ZERO;
+    for yix in centery as i32 - 1..=centery as i32 + 1 {
+        for xix in centerx as i32 - 1..=centerx as i32 + 1 {
+            let x = wrap_coordinate(xix, image.width());
+            let y = wrap_coordinate(yix, image.height());
+            if coverage_buf[(x, y)] {
+                num_pixels += 1;
+                let c = image[(x, y)];
+                sum += Vec3::from(c.0);
+            }
         }
     }
+
+    if num_pixels > 0 {
+        sum / num_pixels as f32
+    } else {
+        Vec3::ZERO
+    }
 }
 
-impl Edge {
-    fn new(mut a: Vertex, mut b: Vertex) -> Self {
-        if compare_vecs(a.pos, b.pos) == std::cmp::Ordering::Greater {
-            std::mem::swap(&mut a, &mut b);
+fn calculate_samples_and_weights(pixel_map: &Array2d<i32>, sample: Vec2) -> ([i32; 4], [f32; 4]) {
+    let truncu = sample.x as i32;
+    let truncv = sample.y as i32;
+
+    let xs = [truncu, truncu + 1, truncu + 1, truncu];
+    let ys = [truncv, truncv, truncv + 1, truncv + 1];
+    let mut out_ixs = [0; 4];
+    for i in 0..4 {
+        let x = wrap_coordinate(xs[i], pixel_map.width);
+        let y = wrap_coordinate(ys[i], pixel_map.height);
+        out_ixs[i] = pixel_map[(x, y)];
+    }
+
+    let frac_x = sample.x - truncu as f32;
+    let frac_y = sample.y - truncv as f32;
+    let out_weights = [
+        EDGE_CONSTRAINTS_WEIGHT * (1.0 - frac_x) * (1.0 - frac_y),
+        EDGE_CONSTRAINTS_WEIGHT * frac_x * (1.0 - frac_y),
+        EDGE_CONSTRAINTS_WEIGHT * frac_x * frac_y,
+        EDGE_CONSTRAINTS_WEIGHT * (1.0 - frac_x) * frac_y,
+    ];
+
+    (out_ixs, out_weights)
+}
+
+fn conjugate_gradient_optimize(
+    a: &CsrMatrix<f32>,
+    guess: &DVector<f32>,
+    b: &DVector<f32>,
+    num_iterations: u32,
+    tolerance: f32,
+) -> DVector<f32> {
+    let n = guess.len();
+    let mut solution = DVector::zeros(n);
+
+    let mut r = b.clone();
+    let mut p = b.clone();
+    let mut rsq = DVector::dot(&r, &r);
+    for _ in 0..num_iterations {
+        let a_p = a * &p;
+        let alpha = rsq / DVector::dot(&p, &a_p);
+        solution += alpha * &p;
+        r -= alpha * &a_p;
+        let rsqnew = DVector::dot(&r, &r);
+        if (rsqnew - rsq).abs() < tolerance * n as f32 {
+            break;
+        }
+        let beta = rsqnew / rsq;
+        p = &r + beta * &p;
+        rsq = rsqnew;
+    }
+
+    solution
+}
+
+struct PixelInfo {
+    x: u32,
+    y: u32,
+    is_covered: bool,
+    colour: Vec3,
+}
+
+fn compute_pixel_info(
+    seam_edges: &[SeamEdge],
+    coverage_buf: &Array2d<bool>,
+    image: &image::Rgb32FImage,
+) -> (Vec<PixelInfo>, Array2d<i32>) {
+    let w = coverage_buf.width;
+    let h = coverage_buf.height;
+
+    let mut pixel_to_pixel_info_map = Array2d::new(w, h, -1);
+    let mut pixel_info = Vec::new();
+
+    for s in seam_edges {
+        let num_samples = s.num_samples(w, h);
+        for e in s.edges {
+            let e0 = uv_to_screen(e.a, w, h);
+            let e1 = uv_to_screen(e.b, w, h);
+            let dt = (e1 - e0) / (num_samples - 1) as f32;
+            let mut sample_point = e0;
+
+            for _ in 0..num_samples {
+                // Go through the four bilinear sample taps
+                let xs = [sample_point.x as u32; 4];
+                let ys = [sample_point.y as u32; 4];
+
+                let xs = [sample_point.x as u32, xs[0] + 1, xs[0] + 1, xs[0]];
+                let ys = [sample_point.y as u32, ys[0], ys[0] + 1, ys[0] + 1];
+
+                for tap in 0..4 {
+                    let x = wrap_coordinate(xs[tap] as i32, w);
+                    let y = wrap_coordinate(ys[tap] as i32, h);
+
+                    if pixel_to_pixel_info_map[(x, y)] == -1 {
+                        let is_covered = coverage_buf[(x, y)];
+
+                        pixel_info.push(PixelInfo {
+                            x,
+                            y,
+                            is_covered,
+                            colour: if is_covered {
+                                Vec3::from(image[(x, y)].0)
+                            } else {
+                                dilate_pixel(x, y, image, coverage_buf)
+                            },
+                        });
+                        pixel_to_pixel_info_map[(x, y)] = pixel_info.len() as i32 - 1;
+                    }
+                }
+
+                sample_point += dt;
+            }
+        }
+    }
+
+    (pixel_info, pixel_to_pixel_info_map)
+}
+
+struct Data {
+    a_t_a: CsrMatrix<f32>,
+    a_tb_r: DVector<f32>,
+    a_tb_g: DVector<f32>,
+    a_tb_b: DVector<f32>,
+    initial_guess_r: DVector<f32>,
+    initial_guess_g: DVector<f32>,
+    initial_guess_b: DVector<f32>,
+}
+
+#[inline(never)]
+fn setup_least_squares(
+    seam_edges: &[SeamEdge],
+    pixel_to_pixel_info_map: &Array2d<i32>,
+    pixel_info: &[PixelInfo],
+) -> Data {
+    let num_pixels_to_optimise = pixel_info.len();
+
+    let mut map_vector: HashMap<_, f32> = HashMap::with_capacity(num_pixels_to_optimise);
+
+    let w = pixel_to_pixel_info_map.width;
+    let h = pixel_to_pixel_info_map.height;
+    for s in seam_edges {
+        // Step through the samples of this edge, and compute sample locations for each side of the seam
+        let num_samples = s.num_samples(w, h);
+
+        let first_half_edge_start = uv_to_screen(s.edges[0].a, w, h);
+        let first_half_edge_end = uv_to_screen(s.edges[0].b, w, h);
+
+        let second_half_edge_start = uv_to_screen(s.edges[1].a, w, h);
+        let second_half_edge_end = uv_to_screen(s.edges[1].b, w, h);
+
+        let first_half_edge_step =
+            (first_half_edge_end - first_half_edge_start) / (num_samples - 1) as f32;
+        let second_half_edge_step =
+            (second_half_edge_end - second_half_edge_start) / (num_samples - 1) as f32;
+
+        let mut first_half_edge_sample = first_half_edge_start;
+        let mut second_half_edge_sample = second_half_edge_start;
+        for _ in 0..num_samples {
+            // Sample locations for the two corresponding sets of sample points
+            let (first_half_edge, first_half_edge_weights) =
+                calculate_samples_and_weights(pixel_to_pixel_info_map, first_half_edge_sample);
+            let (second_half_edge, second_half_edge_weights) =
+                calculate_samples_and_weights(pixel_to_pixel_info_map, second_half_edge_sample);
+
+            /*
+            Now, compute the covariance for the difference of these two vectors.
+            If a is the first vector (first half edge) and b is the second, then we compute the covariance, without
+            intermediate storage, like so:
+            (a-b)*(a-b)^t = a*a^t + b*b^t - a*b^t-b*a^t
+            */
+            for i in 0..4 {
+                for j in 0..4 {
+                    // + a*a^t
+                    *map_vector
+                        .entry((first_half_edge[i], first_half_edge[j]))
+                        .or_default() += first_half_edge_weights[i] * first_half_edge_weights[j];
+                    // + b*b^t
+                    *map_vector
+                        .entry((second_half_edge[i], second_half_edge[j]))
+                        .or_default() += second_half_edge_weights[i] * second_half_edge_weights[j];
+
+                    // - a*b^t
+                    *map_vector
+                        .entry((first_half_edge[i], second_half_edge[j]))
+                        .or_default() -= first_half_edge_weights[i] * second_half_edge_weights[j];
+
+                    // - b*a^t
+                    *map_vector
+                        .entry((second_half_edge[i], first_half_edge[j]))
+                        .or_default() -= second_half_edge_weights[i] * first_half_edge_weights[j];
+                }
+            }
+
+            first_half_edge_sample += first_half_edge_step;
+            second_half_edge_sample += second_half_edge_step;
+        }
+    }
+
+    let mut a_tb_r = DVector::zeros(num_pixels_to_optimise);
+    let mut a_tb_g = DVector::zeros(num_pixels_to_optimise);
+    let mut a_tb_b = DVector::zeros(num_pixels_to_optimise);
+    let mut initial_guess_r = DVector::zeros(num_pixels_to_optimise);
+    let mut initial_guess_g = DVector::zeros(num_pixels_to_optimise);
+    let mut initial_guess_b = DVector::zeros(num_pixels_to_optimise);
+
+    for (i, pi) in pixel_info.iter().enumerate() {
+        // Set up equality cost, trying to keep the pixel at its original value
+        // Note: for non-covered pixels the weight is much lower, since those are the pixels
+        // we primarily want to modify (we'll want to keep it >0 though, to reduce the risk
+        // of extreme values that can't fit in 8 bit color channels)
+        let weight = if pi.is_covered {
+            COVERED_PIXELS_WEIGHT
+        } else {
+            NONCOVERED_PIXELS_WEIGHT
+        };
+
+        *map_vector.entry((i as i32, i as i32)).or_default() += weight;
+
+        // Set up the three right hand sides (one for R, G, and B).
+        // Note AtRHS represents the transpose of the system matrix A multiplied by the RHS
+        a_tb_r[i] += pi.colour.x * weight;
+        a_tb_g[i] += pi.colour.y * weight;
+        a_tb_b[i] += pi.colour.z * weight;
+
+        // Set up the initial guess for the solution.
+        initial_guess_r[i] = pi.colour.x;
+        initial_guess_g[i] = pi.colour.y;
+        initial_guess_b[i] = pi.colour.z;
+    }
+
+    let mut coo_matrix = CooMatrix::new(pixel_info.len(), pixel_info.len());
+
+    for ((x, y), value) in map_vector {
+        coo_matrix.push(x as usize, y as usize, value);
+    }
+
+    Data {
+        a_t_a: CsrMatrix::from(&coo_matrix),
+        a_tb_r,
+        a_tb_g,
+        a_tb_b,
+        initial_guess_r,
+        initial_guess_g,
+        initial_guess_b,
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let mesh_filename = std::env::args().nth(1).unwrap();
+    let tex_filename = std::env::args().nth(2).unwrap();
+    let tex_out_filename = std::env::args().nth(3).unwrap();
+
+    let mesh = {
+        let bytes = std::fs::read(&mesh_filename).unwrap();
+
+        let (gltf, buffer): (
+            goth_gltf::Gltf<goth_gltf::default_extensions::Extensions>,
+            _,
+        ) = goth_gltf::Gltf::from_bytes(&bytes).unwrap();
+
+        let node_tree = NodeTree::new(&gltf);
+        let buffer_view_map = collect_buffer_view_map(&gltf, buffer, &Path::new(&mesh_filename))?;
+
+        let mut combined_positions = Vec::new();
+        let mut combined_indices = Vec::new();
+        let mut combined_second_uvs = Vec::new();
+
+        for (node_id, node) in gltf.nodes.iter().enumerate() {
+            let transform = node_tree.transform_of(node_id);
+
+            let mesh_id = match node.mesh {
+                Some(mesh_id) => mesh_id,
+                None => continue,
+            };
+
+            let mesh = &gltf.meshes[mesh_id];
+
+            for (primitive_id, primitive) in mesh.primitives.iter().enumerate() {
+                let reader = accessors::PrimitiveReader::new(&gltf, &primitive, &buffer_view_map);
+
+                let positions = match reader.read_positions()? {
+                    None => {
+                        println!(
+                            "Positions missing for mesh {}, primitive {}. Skipping",
+                            mesh_id, primitive_id
+                        );
+                        continue;
+                    }
+                    Some(positions) => positions,
+                };
+
+                let indices = match reader.read_indices()? {
+                    None => {
+                        println!(
+                            "Indices missing for mesh {}, primitive {}. Skipping",
+                            mesh_id, primitive_id
+                        );
+                        continue;
+                    }
+                    Some(indices) => indices,
+                };
+
+                let second_uvs = match reader.read_second_uvs()? {
+                    None => {
+                        println!(
+                            "Second UVs missing for mesh {}, primitive {}. Skipping",
+                            mesh_id, primitive_id
+                        );
+                        continue;
+                    }
+                    Some(second_uvs) => second_uvs,
+                };
+
+                let indices_offset = combined_positions.len() as u32;
+
+                combined_indices.extend(indices.iter().map(|index| indices_offset + index));
+                combined_positions.extend(positions.iter().map(|position| (transform * position.extend(1.0)).truncate()));
+                combined_second_uvs.extend_from_slice(&second_uvs);
+            }
         }
 
-        Self { a, b }
-    }
-}
+        Mesh {
+            positions: combined_positions,
+            indices: combined_indices,
+            uvs: combined_second_uvs,
+        }
+    };
 
-impl rstar::Point for Edge {
-    type Scalar = f32;
+    let mut orig_image = image::open(&tex_filename).unwrap();
 
-    const DIMENSIONS: usize = 3;
+    let image = orig_image.crop(0,0,orig_image.width()/4,orig_image.height()).to_rgb32f();
 
-    fn generate(mut generator: impl FnMut(usize) -> Self::Scalar) -> Self {
-        Self::from(Vec3::new(generator(0), generator(1), generator(2)))
+    let mut orig_image = orig_image.to_rgb32f();
+
+    let w = image.width() as usize;
+    let h = image.height() as usize;
+
+    let seam_edges = find_seam_edges(&mesh);
+    dbg!(&seam_edges.len());
+
+    let mut coverage_buf = Array2d::new(w as u32, h as u32, false);
+    for tri in mesh.indices.chunks(3) {
+        let uv0 = mesh.uvs[tri[0] as usize];
+        let uv1 = mesh.uvs[tri[1] as usize];
+        let uv2 = mesh.uvs[tri[2] as usize];
+
+        rasterize_face(uv0, uv1, uv2, &mut coverage_buf);
     }
-    fn nth(&self, index: usize) -> Self::Scalar {
-        self.a.pos[index]
+
+    let (pixel_info, pixel_to_pixel_info_map) =
+        compute_pixel_info(&seam_edges, &coverage_buf, &image);
+    let num_pixels_to_optimise = pixel_info.len();
+
+
+    /*{
+        let mut cov = image::RgbImage::new(coverage_buf.width, coverage_buf.height);
+
+        for x in 0 .. coverage_buf.width {
+            for y in 0 .. coverage_buf.height {
+                if coverage_buf[(x, y)] {
+                    cov[(x, y)].0 = [255; 3];
+                }
+            }
+        }
+
+        cov.save("coverage.png").unwrap();
+    }*/
+
+    dbg!(&num_pixels_to_optimise);
+
+    let data = setup_least_squares(&seam_edges, &pixel_to_pixel_info_map, &pixel_info);
+
+    let mut solution_r = None;
+    let mut solution_g = None;
+    let mut solution_b = None;
+
+    dbg!(());
+
+    rayon::scope(|s| {
+        s.spawn(|_| {
+            solution_r = Some(conjugate_gradient_optimize(
+                &data.a_t_a,
+                &data.initial_guess_r,
+                &data.a_tb_r,
+                10000,
+                TOLERANCE,
+            ))
+        });
+        s.spawn(|_| {
+            solution_g = Some(conjugate_gradient_optimize(
+                &data.a_t_a,
+                &data.initial_guess_g,
+                &data.a_tb_g,
+                10000,
+                TOLERANCE,
+            ))
+        });
+        s.spawn(|_| {
+            solution_b = Some(conjugate_gradient_optimize(
+                &data.a_t_a,
+                &data.initial_guess_b,
+                &data.a_tb_b,
+                10000,
+                TOLERANCE,
+            ))
+        });
+    });
+
+    let solution_r = solution_r.unwrap();
+    let solution_g = solution_g.unwrap();
+    let solution_b = solution_b.unwrap();
+
+
+    for (i, pi) in pixel_info.iter().enumerate() {
+        orig_image[(pi.x, pi.y)].0 = Vec3::new(solution_r[i], solution_g[i], solution_b[i]).max(Vec3::ZERO).into();
     }
-    fn nth_mut(&mut self, index: usize) -> &mut Self::Scalar {
-        &mut self.a.pos[index]
-    }
+
+    orig_image.save(&tex_out_filename).unwrap();
+
+    Ok(())
 }

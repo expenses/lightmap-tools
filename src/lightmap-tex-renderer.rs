@@ -1,11 +1,7 @@
 #[path = "lightmap-tex-renderer/accessors.rs"]
 mod accessors;
-use goth_gltf::default_extensions::Extensions;
-use goth_gltf::extensions::CompressionMode;
-use std::collections::HashMap;
-use std::path::Path;
+use lightmap_tools::{collect_buffer_view_map, NodeTree};
 use wgpu::util::DeviceExt;
-use lightmap_tools::{NodeTree, collect_buffer_view_map};
 
 use structopt::StructOpt;
 
@@ -35,7 +31,6 @@ fn main() -> anyhow::Result<()> {
 
     for (node_id, node) in gltf.nodes.iter().enumerate() {
         let transform = node_tree.transform_of(node_id);
-        let normal_matrix = glam::Mat3::from_mat4(transform.inverse().transpose());
 
         let mesh_id = match node.mesh {
             Some(mesh_id) => mesh_id,
@@ -81,8 +76,6 @@ fn main() -> anyhow::Result<()> {
             };
 
             let normals = reader.read_normals()?.unwrap();
-
-            let indices_offset = combined_positions.len() as u32;
 
             for triangle in indices.chunks(3) {
                 let indices: [usize; 3] = std::array::from_fn(|i| triangle[i] as usize);
@@ -220,7 +213,9 @@ fn main() -> anyhow::Result<()> {
     };
 
     let buffer_descriptor_for_pixel_size = |pixel_size_in_bytes| wgpu::BufferDescriptor {
-        size: (calculate_padding_for_pixel_size(pixel_size_in_bytes) * output_dim.height * pixel_size_in_bytes) as u64,
+        size: (calculate_padding_for_pixel_size(pixel_size_in_bytes)
+            * output_dim.height
+            * pixel_size_in_bytes) as u64,
         label: None,
         mapped_at_creation: false,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
@@ -239,8 +234,12 @@ fn main() -> anyhow::Result<()> {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
     };
 
-    let positions_tex = device.create_texture(&texture_descriptor_for_format(wgpu::TextureFormat::Rgba32Float));
-    let normals_tex = device.create_texture(&texture_descriptor_for_format(wgpu::TextureFormat::Rgba32Float));
+    let positions_tex = device.create_texture(&texture_descriptor_for_format(
+        wgpu::TextureFormat::Rgba32Float,
+    ));
+    let normals_tex = device.create_texture(&texture_descriptor_for_format(
+        wgpu::TextureFormat::Rgba32Float,
+    ));
 
     let positions_tex_view = positions_tex.create_view(&Default::default());
     let normals_tex_view = normals_tex.create_view(&Default::default());
@@ -279,7 +278,12 @@ fn main() -> anyhow::Result<()> {
 
     let image_layout_for_pixel_size = |pixel_size_in_bytes| wgpu::ImageDataLayout {
         offset: 0,
-        bytes_per_row: Some(std::num::NonZeroU32::new(calculate_padding_for_pixel_size(pixel_size_in_bytes) * pixel_size_in_bytes).unwrap()),
+        bytes_per_row: Some(
+            std::num::NonZeroU32::new(
+                calculate_padding_for_pixel_size(pixel_size_in_bytes) * pixel_size_in_bytes,
+            )
+            .unwrap(),
+        ),
         rows_per_image: None,
     };
 

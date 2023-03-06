@@ -8,7 +8,7 @@ fn main() {
 
     let base_image = image::open(&filename).unwrap();
 
-    let mut sh_0 = base_image
+    let sh_0 = base_image
         .crop_imm(
             0, //i as u32 * image.width() / 4,
             0,
@@ -56,7 +56,7 @@ fn main() {
         }
     }
 
-    let mut images = &mut [sh_0, sh_1_x, sh_1_y, sh_1_z];
+    let images = &mut [sh_0, sh_1_x, sh_1_y, sh_1_z];
 
     for (output, image) in std::env::args().skip(3).zip(images.iter_mut()) {
         let floats: &mut [f32] = &mut *image;
