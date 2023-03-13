@@ -2,18 +2,20 @@ use glam::{Vec2, Vec3};
 use nalgebra::DVector;
 use nalgebra_sparse::{coo::CooMatrix, csr::CsrMatrix};
 use std::collections::HashMap;
-use std::path::Path;
 use std::hash::{Hash, Hasher};
 use std::ops::{Index, IndexMut};
+use std::path::Path;
 #[path = "lightmap-tex-renderer/accessors.rs"]
 mod accessors;
 use lightmap_tools::{collect_buffer_view_map, NodeTree};
 
-
 const EDGE_CONSTRAINTS_WEIGHT: f32 = 5.0;
 const COVERED_PIXELS_WEIGHT: f32 = 1.0;
 const NONCOVERED_PIXELS_WEIGHT: f32 = 0.1;
-const TOLERANCE: f32 = 0.01 / 255.0;
+const TOLERANCE: f32 = 0.01;
+// A weight multiplier. A value like 255 or higher is needed for HDR textures with most values between
+// 0 and 1. Seems to do something similar to TOLERANCE but not quite.
+const MULTIPLIER: f32 = 1024.0;
 
 struct Array2d<T> {
     data: Vec<T>,
@@ -182,7 +184,11 @@ fn rasterize_face(uv0: Vec2, uv1: Vec2, uv2: Vec2, coverage_buf: &mut Array2d<bo
     // Now just loop over a screen aligned bounding box around the triangle, and test each pixel against all three edges
     for y in miny..maxy {
         for x in minx..maxx {
-            if (is_inside(x, y, e0a, e0b) && is_inside(x, y, e1a, e1b) && is_inside(x, y, e2a, e2b)) || (is_inside(x, y, e0b, e0a) && is_inside(x, y, e1b, e1a) && is_inside(x, y, e2b, e2a)) {
+            if (is_inside(x, y, e0a, e0b) && is_inside(x, y, e1a, e1b) && is_inside(x, y, e2a, e2b))
+                || (is_inside(x, y, e0b, e0a)
+                    && is_inside(x, y, e1b, e1a)
+                    && is_inside(x, y, e2b, e2a))
+            {
                 let index = (
                     wrap_coordinate(x, coverage_buf.width),
                     wrap_coordinate(y, coverage_buf.height),
@@ -440,9 +446,9 @@ fn setup_least_squares(
 
         // Set up the three right hand sides (one for R, G, and B).
         // Note AtRHS represents the transpose of the system matrix A multiplied by the RHS
-        a_tb_r[i] += pi.colour.x * weight;
-        a_tb_g[i] += pi.colour.y * weight;
-        a_tb_b[i] += pi.colour.z * weight;
+        a_tb_r[i] += pi.colour.x * weight * MULTIPLIER;
+        a_tb_g[i] += pi.colour.y * weight * MULTIPLIER;
+        a_tb_b[i] += pi.colour.z * weight * MULTIPLIER;
 
         // Set up the initial guess for the solution.
         initial_guess_r[i] = pi.colour.x;
@@ -536,7 +542,11 @@ fn main() -> anyhow::Result<()> {
                 let indices_offset = combined_positions.len() as u32;
 
                 combined_indices.extend(indices.iter().map(|index| indices_offset + index));
-                combined_positions.extend(positions.iter().map(|position| (transform * position.extend(1.0)).truncate()));
+                combined_positions.extend(
+                    positions
+                        .iter()
+                        .map(|position| (transform * position.extend(1.0)).truncate()),
+                );
                 combined_second_uvs.extend_from_slice(&second_uvs);
             }
         }
@@ -550,7 +560,9 @@ fn main() -> anyhow::Result<()> {
 
     let mut orig_image = image::open(&tex_filename).unwrap();
 
-    let image = orig_image.crop(0,0,orig_image.width()/4,orig_image.height()).to_rgb32f();
+    let image = orig_image
+        .crop(0, 0, orig_image.width() / 4, orig_image.height())
+        .to_rgb32f();
 
     let mut orig_image = orig_image.to_rgb32f();
 
@@ -572,7 +584,6 @@ fn main() -> anyhow::Result<()> {
     let (pixel_info, pixel_to_pixel_info_map) =
         compute_pixel_info(&seam_edges, &coverage_buf, &image);
     let num_pixels_to_optimise = pixel_info.len();
-
 
     /*{
         let mut cov = image::RgbImage::new(coverage_buf.width, coverage_buf.height);
@@ -632,9 +643,11 @@ fn main() -> anyhow::Result<()> {
     let solution_g = solution_g.unwrap();
     let solution_b = solution_b.unwrap();
 
-
     for (i, pi) in pixel_info.iter().enumerate() {
-        orig_image[(pi.x, pi.y)].0 = Vec3::new(solution_r[i], solution_g[i], solution_b[i]).max(Vec3::ZERO).into();
+        orig_image[(pi.x, pi.y)].0 = (Vec3::new(solution_r[i], solution_g[i], solution_b[i])
+            / MULTIPLIER)
+            .max(Vec3::ZERO)
+            .into();
     }
 
     orig_image.save(&tex_out_filename).unwrap();
