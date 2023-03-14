@@ -8,14 +8,14 @@ use std::path::Path;
 #[path = "lightmap-tex-renderer/accessors.rs"]
 mod accessors;
 use lightmap_tools::{collect_buffer_view_map, NodeTree};
+use parking_lot::Mutex;
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 const EDGE_CONSTRAINTS_WEIGHT: f32 = 5.0;
 const COVERED_PIXELS_WEIGHT: f32 = 1.0;
 const NONCOVERED_PIXELS_WEIGHT: f32 = 0.1;
-const TOLERANCE: f32 = 0.01;
-// A weight multiplier. A value like 255 or higher is needed for HDR textures with most values between
-// 0 and 1. Seems to do something similar to TOLERANCE but not quite.
-const MULTIPLIER: f32 = 1024.0;
+const TOLERANCE: f32 = 10.0e-10;
+const NUM_ITERATIONS: u32 = 10000;
 
 struct Array2d<T> {
     data: Vec<T>,
@@ -259,18 +259,18 @@ fn conjugate_gradient_optimize(
     tolerance: f32,
 ) -> DVector<f32> {
     let n = guess.len();
-    let mut solution = DVector::zeros(n);
-
-    let mut r = b.clone();
-    let mut p = b.clone();
+    let mut solution = guess.clone();
+    let mut r = b - a * &solution;
+    let mut p = r.clone();
     let mut rsq = DVector::dot(&r, &r);
-    for _ in 0..num_iterations {
+    for i in 0..num_iterations {
         let a_p = a * &p;
         let alpha = rsq / DVector::dot(&p, &a_p);
         solution += alpha * &p;
         r -= alpha * &a_p;
         let rsqnew = DVector::dot(&r, &r);
         if (rsqnew - rsq).abs() < tolerance * n as f32 {
+            dbg!(i);
             break;
         }
         let beta = rsqnew / rsq;
@@ -285,13 +285,11 @@ struct PixelInfo {
     x: u32,
     y: u32,
     is_covered: bool,
-    colour: Vec3,
 }
 
 fn compute_pixel_info(
     seam_edges: &[SeamEdge],
     coverage_buf: &Array2d<bool>,
-    image: &image::Rgb32FImage,
 ) -> (Vec<PixelInfo>, Array2d<i32>) {
     let w = coverage_buf.width;
     let h = coverage_buf.height;
@@ -322,16 +320,7 @@ fn compute_pixel_info(
                     if pixel_to_pixel_info_map[(x, y)] == -1 {
                         let is_covered = coverage_buf[(x, y)];
 
-                        pixel_info.push(PixelInfo {
-                            x,
-                            y,
-                            is_covered,
-                            colour: if is_covered {
-                                Vec3::from(image[(x, y)].0)
-                            } else {
-                                dilate_pixel(x, y, image, coverage_buf)
-                            },
-                        });
+                        pixel_info.push(PixelInfo { x, y, is_covered });
                         pixel_to_pixel_info_map[(x, y)] = pixel_info.len() as i32 - 1;
                     }
                 }
@@ -359,6 +348,8 @@ fn setup_least_squares(
     seam_edges: &[SeamEdge],
     pixel_to_pixel_info_map: &Array2d<i32>,
     pixel_info: &[PixelInfo],
+    image: &image::Rgb32FImage,
+    coverage_buf: &Array2d<bool>,
 ) -> Data {
     let num_pixels_to_optimise = pixel_info.len();
 
@@ -444,16 +435,22 @@ fn setup_least_squares(
 
         *map_vector.entry((i as i32, i as i32)).or_default() += weight;
 
+        let colour = if pi.is_covered {
+            Vec3::from(image[(pi.x, pi.y)].0)
+        } else {
+            dilate_pixel(pi.x, pi.y, image, coverage_buf)
+        };
+
         // Set up the three right hand sides (one for R, G, and B).
         // Note AtRHS represents the transpose of the system matrix A multiplied by the RHS
-        a_tb_r[i] += pi.colour.x * weight * MULTIPLIER;
-        a_tb_g[i] += pi.colour.y * weight * MULTIPLIER;
-        a_tb_b[i] += pi.colour.z * weight * MULTIPLIER;
+        a_tb_r[i] += colour.x * weight;
+        a_tb_g[i] += colour.y * weight;
+        a_tb_b[i] += colour.z * weight;
 
         // Set up the initial guess for the solution.
-        initial_guess_r[i] = pi.colour.x;
-        initial_guess_g[i] = pi.colour.y;
-        initial_guess_b[i] = pi.colour.z;
+        initial_guess_r[i] = colour.x;
+        initial_guess_g[i] = colour.y;
+        initial_guess_b[i] = colour.z;
     }
 
     let mut coo_matrix = CooMatrix::new(pixel_info.len(), pixel_info.len());
@@ -487,7 +484,7 @@ fn main() -> anyhow::Result<()> {
         ) = goth_gltf::Gltf::from_bytes(&bytes).unwrap();
 
         let node_tree = NodeTree::new(&gltf);
-        let buffer_view_map = collect_buffer_view_map(&gltf, buffer, &Path::new(&mesh_filename))?;
+        let buffer_view_map = collect_buffer_view_map(&gltf, buffer, Path::new(&mesh_filename))?;
 
         let mut combined_positions = Vec::new();
         let mut combined_indices = Vec::new();
@@ -504,7 +501,7 @@ fn main() -> anyhow::Result<()> {
             let mesh = &gltf.meshes[mesh_id];
 
             for (primitive_id, primitive) in mesh.primitives.iter().enumerate() {
-                let reader = accessors::PrimitiveReader::new(&gltf, &primitive, &buffer_view_map);
+                let reader = accessors::PrimitiveReader::new(&gltf, primitive, &buffer_view_map);
 
                 let positions = match reader.read_positions()? {
                     None => {
@@ -560,14 +557,8 @@ fn main() -> anyhow::Result<()> {
 
     let mut orig_image = image::open(&tex_filename).unwrap();
 
-    let image = orig_image
-        .crop(0, 0, orig_image.width() / 4, orig_image.height())
-        .to_rgb32f();
-
-    let mut orig_image = orig_image.to_rgb32f();
-
-    let w = image.width() as usize;
-    let h = image.height() as usize;
+    let w = orig_image.width() as usize / 4;
+    let h = orig_image.height() as usize;
 
     let seam_edges = find_seam_edges(&mesh);
     dbg!(&seam_edges.len());
@@ -581,76 +572,102 @@ fn main() -> anyhow::Result<()> {
         rasterize_face(uv0, uv1, uv2, &mut coverage_buf);
     }
 
-    let (pixel_info, pixel_to_pixel_info_map) =
-        compute_pixel_info(&seam_edges, &coverage_buf, &image);
+    let (pixel_info, pixel_to_pixel_info_map) = compute_pixel_info(&seam_edges, &coverage_buf);
     let num_pixels_to_optimise = pixel_info.len();
-
-    /*{
-        let mut cov = image::RgbImage::new(coverage_buf.width, coverage_buf.height);
-
-        for x in 0 .. coverage_buf.width {
-            for y in 0 .. coverage_buf.height {
-                if coverage_buf[(x, y)] {
-                    cov[(x, y)].0 = [255; 3];
-                }
-            }
-        }
-
-        cov.save("coverage.png").unwrap();
-    }*/
 
     dbg!(&num_pixels_to_optimise);
 
-    let data = setup_least_squares(&seam_edges, &pixel_to_pixel_info_map, &pixel_info);
+    let images = [
+        orig_image
+            .crop(0, 0, orig_image.width() / 4, orig_image.height())
+            .to_rgb32f(),
+        orig_image
+            .crop(
+                orig_image.width() / 4,
+                0,
+                orig_image.width() / 4,
+                orig_image.height(),
+            )
+            .to_rgb32f(),
+        orig_image
+            .crop(
+                orig_image.width() / 2,
+                0,
+                orig_image.width() / 4,
+                orig_image.height(),
+            )
+            .to_rgb32f(),
+        orig_image
+            .crop(
+                orig_image.width() * 3 / 4,
+                0,
+                orig_image.width() / 4,
+                orig_image.height(),
+            )
+            .to_rgb32f(),
+    ];
 
-    let mut solution_r = None;
-    let mut solution_g = None;
-    let mut solution_b = None;
+    let orig_image = Mutex::new(orig_image.to_rgb32f());
 
-    dbg!(());
+    images.par_iter().enumerate().for_each(|(i, image)| {
+        let data = setup_least_squares(
+            &seam_edges,
+            &pixel_to_pixel_info_map,
+            &pixel_info,
+            image,
+            &coverage_buf,
+        );
 
-    rayon::scope(|s| {
-        s.spawn(|_| {
-            solution_r = Some(conjugate_gradient_optimize(
-                &data.a_t_a,
-                &data.initial_guess_r,
-                &data.a_tb_r,
-                10000,
-                TOLERANCE,
-            ))
+        let mut solution_r = None;
+        let mut solution_g = None;
+        let mut solution_b = None;
+
+        dbg!(());
+
+        rayon::scope(|s| {
+            s.spawn(|_| {
+                solution_r = Some(conjugate_gradient_optimize(
+                    &data.a_t_a,
+                    &data.initial_guess_r,
+                    &data.a_tb_r,
+                    NUM_ITERATIONS,
+                    TOLERANCE,
+                ))
+            });
+            s.spawn(|_| {
+                solution_g = Some(conjugate_gradient_optimize(
+                    &data.a_t_a,
+                    &data.initial_guess_g,
+                    &data.a_tb_g,
+                    NUM_ITERATIONS,
+                    TOLERANCE,
+                ))
+            });
+            s.spawn(|_| {
+                solution_b = Some(conjugate_gradient_optimize(
+                    &data.a_t_a,
+                    &data.initial_guess_b,
+                    &data.a_tb_b,
+                    NUM_ITERATIONS,
+                    TOLERANCE,
+                ))
+            });
         });
-        s.spawn(|_| {
-            solution_g = Some(conjugate_gradient_optimize(
-                &data.a_t_a,
-                &data.initial_guess_g,
-                &data.a_tb_g,
-                10000,
-                TOLERANCE,
-            ))
-        });
-        s.spawn(|_| {
-            solution_b = Some(conjugate_gradient_optimize(
-                &data.a_t_a,
-                &data.initial_guess_b,
-                &data.a_tb_b,
-                10000,
-                TOLERANCE,
-            ))
-        });
+
+        let solution_r = solution_r.unwrap();
+        let solution_g = solution_g.unwrap();
+        let solution_b = solution_b.unwrap();
+
+        let offset = i as u32 * image.width();
+
+        let mut orig_image = orig_image.lock();
+
+        for (i, pi) in pixel_info.iter().enumerate() {
+            orig_image[(offset + pi.x, pi.y)].0 = [solution_r[i], solution_g[i], solution_b[i]];
+        }
     });
 
-    let solution_r = solution_r.unwrap();
-    let solution_g = solution_g.unwrap();
-    let solution_b = solution_b.unwrap();
-
-    for (i, pi) in pixel_info.iter().enumerate() {
-        orig_image[(pi.x, pi.y)].0 = (Vec3::new(solution_r[i], solution_g[i], solution_b[i])
-            / MULTIPLIER)
-            .max(Vec3::ZERO)
-            .into();
-    }
-
-    orig_image.save(&tex_out_filename).unwrap();
+    orig_image.lock().save(&tex_out_filename).unwrap();
 
     Ok(())
 }

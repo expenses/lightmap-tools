@@ -1,4 +1,4 @@
-use rayon::iter::{IntoParallelRefIterator, ParallelBridge, ParallelIterator};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();

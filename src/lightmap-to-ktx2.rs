@@ -7,7 +7,7 @@ fn main() {
 
     let base_image = image::open(&filename).unwrap();
 
-    let mut sh_0 = base_image
+    let sh_0 = base_image
         .crop_imm(0, 0, base_image.width() / 4, base_image.height())
         .to_rgba32f();
 
@@ -48,9 +48,10 @@ fn main() {
         if float.is_nan() {
             *float = 0.0;
         }
+        *float = float.max(-1.0).min(1.0);
     }
 
-    let mut images = &mut [sh_0, sh_1_x, sh_1_y, sh_1_z];
+    let images = &mut [sh_0, sh_1_x, sh_1_y, sh_1_z];
 
     for (output, image) in std::env::args().skip(2).zip(images.iter_mut()) {
         let floats: &mut [f32] = &mut *image;
