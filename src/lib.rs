@@ -2,6 +2,17 @@ use goth_gltf::default_extensions::Extensions;
 use std::collections::HashMap;
 use std::path::Path;
 
+pub fn normalize_float(base: f32, mut float: f32) -> u8 {
+    float /= base;
+    if float.is_nan() {
+        float = 0.0;
+    }
+    float = float.max(-1.0).min(1.0);
+
+    float = (float + 1.0) * 128.0;
+    float as u8
+}
+
 pub fn init_wgpu() -> anyhow::Result<(wgpu::Device, wgpu::Queue)> {
     let backend = wgpu::util::backend_bits_from_env().unwrap_or_else(wgpu::Backends::all);
     let instance = wgpu::Instance::new(backend);

@@ -1,17 +1,7 @@
 use half::f16;
 use ktx2_tools::ktx2;
+use lightmap_tools::normalize_float;
 use std::borrow::Cow;
-
-fn normalize_float(base: f32, mut float: f32) -> u8 {
-    float /= base;
-    if float.is_nan() {
-        float = 0.0;
-    }
-    float = float.max(-1.0).min(1.0);
-
-    float = (float + 1.0) * 128.0;
-    float as u8
-}
 
 fn main() {
     let mut args = std::env::args().skip(1);
