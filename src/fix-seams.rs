@@ -333,8 +333,20 @@ fn compute_pixel_info(
     (pixel_info, pixel_to_pixel_info_map)
 }
 
+fn join3<A, B, C, RA, RB, RC>(oper_a: A, oper_b: B, oper_c: C) -> (RA, RB, RC)
+where
+    A: FnOnce() -> RA + Send,
+    B: FnOnce() -> RB + Send,
+    C: FnOnce() -> RC + Send,
+    RA: Send,
+    RB: Send,
+    RC: Send,
+{
+    let ((a, b), c) = rayon::join(|| rayon::join(oper_a, oper_b), oper_c);
+    (a, b, c)
+}
+
 struct Data {
-    a_t_a: CsrMatrix<f32>,
     a_tb_r: DVector<f32>,
     a_tb_g: DVector<f32>,
     a_tb_b: DVector<f32>,
@@ -343,17 +355,14 @@ struct Data {
     initial_guess_b: DVector<f32>,
 }
 
-#[inline(never)]
-fn setup_least_squares(
+fn setup_ata_matrix(
     seam_edges: &[SeamEdge],
-    pixel_to_pixel_info_map: &Array2d<i32>,
     pixel_info: &[PixelInfo],
-    image: &image::Rgb32FImage,
-    coverage_buf: &Array2d<bool>,
-) -> Data {
+    pixel_to_pixel_info_map: &Array2d<i32>,
+) -> CsrMatrix<f32> {
     let num_pixels_to_optimise = pixel_info.len();
 
-    let mut map_vector: HashMap<_, f32> = HashMap::with_capacity(num_pixels_to_optimise);
+    let mut matrix_map: HashMap<_, f32> = HashMap::with_capacity(num_pixels_to_optimise);
 
     let w = pixel_to_pixel_info_map.width;
     let h = pixel_to_pixel_info_map.height;
@@ -390,21 +399,21 @@ fn setup_least_squares(
             for i in 0..4 {
                 for j in 0..4 {
                     // + a*a^t
-                    *map_vector
+                    *matrix_map
                         .entry((first_half_edge[i], first_half_edge[j]))
                         .or_default() += first_half_edge_weights[i] * first_half_edge_weights[j];
                     // + b*b^t
-                    *map_vector
+                    *matrix_map
                         .entry((second_half_edge[i], second_half_edge[j]))
                         .or_default() += second_half_edge_weights[i] * second_half_edge_weights[j];
 
                     // - a*b^t
-                    *map_vector
+                    *matrix_map
                         .entry((first_half_edge[i], second_half_edge[j]))
                         .or_default() -= first_half_edge_weights[i] * second_half_edge_weights[j];
 
                     // - b*a^t
-                    *map_vector
+                    *matrix_map
                         .entry((second_half_edge[i], first_half_edge[j]))
                         .or_default() -= second_half_edge_weights[i] * first_half_edge_weights[j];
                 }
@@ -414,6 +423,36 @@ fn setup_least_squares(
             second_half_edge_sample += second_half_edge_step;
         }
     }
+
+    for (i, pi) in pixel_info.iter().enumerate() {
+        // Set up equality cost, trying to keep the pixel at its original value
+        // Note: for non-covered pixels the weight is much lower, since those are the pixels
+        // we primarily want to modify (we'll want to keep it >0 though, to reduce the risk
+        // of extreme values that can't fit in 8 bit color channels)
+        let weight = if pi.is_covered {
+            COVERED_PIXELS_WEIGHT
+        } else {
+            NONCOVERED_PIXELS_WEIGHT
+        };
+
+        *matrix_map.entry((i as i32, i as i32)).or_default() += weight;
+    }
+
+    let mut coo_matrix = CooMatrix::new(pixel_info.len(), pixel_info.len());
+
+    for (&(x, y), &value) in matrix_map.iter() {
+        coo_matrix.push(x as usize, y as usize, value);
+    }
+
+    CsrMatrix::from(&coo_matrix)
+}
+
+fn setup_least_squares(
+    pixel_info: &[PixelInfo],
+    image: &image::Rgb32FImage,
+    coverage_buf: &Array2d<bool>,
+) -> Data {
+    let num_pixels_to_optimise = pixel_info.len();
 
     let mut a_tb_r = DVector::zeros(num_pixels_to_optimise);
     let mut a_tb_g = DVector::zeros(num_pixels_to_optimise);
@@ -433,8 +472,6 @@ fn setup_least_squares(
             NONCOVERED_PIXELS_WEIGHT
         };
 
-        *map_vector.entry((i as i32, i as i32)).or_default() += weight;
-
         let colour = if pi.is_covered {
             Vec3::from(image[(pi.x, pi.y)].0)
         } else {
@@ -443,9 +480,9 @@ fn setup_least_squares(
 
         // Set up the three right hand sides (one for R, G, and B).
         // Note AtRHS represents the transpose of the system matrix A multiplied by the RHS
-        a_tb_r[i] += colour.x * weight;
-        a_tb_g[i] += colour.y * weight;
-        a_tb_b[i] += colour.z * weight;
+        a_tb_r[i] = colour.x * weight;
+        a_tb_g[i] = colour.y * weight;
+        a_tb_b[i] = colour.z * weight;
 
         // Set up the initial guess for the solution.
         initial_guess_r[i] = colour.x;
@@ -453,14 +490,7 @@ fn setup_least_squares(
         initial_guess_b[i] = colour.z;
     }
 
-    let mut coo_matrix = CooMatrix::new(pixel_info.len(), pixel_info.len());
-
-    for ((x, y), value) in map_vector {
-        coo_matrix.push(x as usize, y as usize, value);
-    }
-
     Data {
-        a_t_a: CsrMatrix::from(&coo_matrix),
         a_tb_r,
         a_tb_g,
         a_tb_b,
@@ -575,6 +605,8 @@ fn main() -> anyhow::Result<()> {
     let (pixel_info, pixel_to_pixel_info_map) = compute_pixel_info(&seam_edges, &coverage_buf);
     let num_pixels_to_optimise = pixel_info.len();
 
+    let a_t_a = setup_ata_matrix(&seam_edges, &pixel_info, &pixel_to_pixel_info_map);
+
     dbg!(&num_pixels_to_optimise);
 
     let images = [
@@ -610,53 +642,39 @@ fn main() -> anyhow::Result<()> {
     let orig_image = Mutex::new(orig_image.to_rgb32f());
 
     images.par_iter().enumerate().for_each(|(i, image)| {
-        let data = setup_least_squares(
-            &seam_edges,
-            &pixel_to_pixel_info_map,
-            &pixel_info,
-            image,
-            &coverage_buf,
-        );
-
-        let mut solution_r = None;
-        let mut solution_g = None;
-        let mut solution_b = None;
+        let data = setup_least_squares(&pixel_info, image, &coverage_buf);
 
         dbg!(());
 
-        rayon::scope(|s| {
-            s.spawn(|_| {
-                solution_r = Some(conjugate_gradient_optimize(
-                    &data.a_t_a,
+        let (solution_r, solution_g, solution_b) = join3(
+            || {
+                conjugate_gradient_optimize(
+                    &a_t_a,
                     &data.initial_guess_r,
                     &data.a_tb_r,
                     NUM_ITERATIONS,
                     TOLERANCE,
-                ))
-            });
-            s.spawn(|_| {
-                solution_g = Some(conjugate_gradient_optimize(
-                    &data.a_t_a,
+                )
+            },
+            || {
+                conjugate_gradient_optimize(
+                    &a_t_a,
                     &data.initial_guess_g,
                     &data.a_tb_g,
                     NUM_ITERATIONS,
                     TOLERANCE,
-                ))
-            });
-            s.spawn(|_| {
-                solution_b = Some(conjugate_gradient_optimize(
-                    &data.a_t_a,
+                )
+            },
+            || {
+                conjugate_gradient_optimize(
+                    &a_t_a,
                     &data.initial_guess_b,
                     &data.a_tb_b,
                     NUM_ITERATIONS,
                     TOLERANCE,
-                ))
-            });
-        });
-
-        let solution_r = solution_r.unwrap();
-        let solution_g = solution_g.unwrap();
-        let solution_b = solution_b.unwrap();
+                )
+            },
+        );
 
         let offset = i as u32 * image.width();
 

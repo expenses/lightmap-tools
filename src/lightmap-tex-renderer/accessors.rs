@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 use glam::{UVec4, Vec2, Vec3, Vec4};
 use goth_gltf::default_extensions::Extensions;
 use goth_gltf::ComponentType;
